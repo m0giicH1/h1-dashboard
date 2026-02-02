@@ -1,0 +1,224 @@
+# ============================================
+# H1 VOLATILITY LAB - CRITICAL IGNORE LIST
+# ============================================
+
+# 🚨🚨🚨 NEVER COMMIT THESE TO GITHUB 🚨🚨🚨
+
+# 1. SECRETS & CONFIGURATION (MOST IMPORTANT!)
+.env
+.env.local
+.env.*
+secrets.json
+credentials.json
+config.json
+config.local.json
+*.key
+*.pem
+*.cert
+*.crt
+schwab_credentials.*
+discord_webhook.*
+
+# 2. DATABASE FILES (Can get VERY large)
+*.db
+*.sqlite
+*.sqlite3
+h1_states.db
+h1_production.db
+*.dump
+*.backup
+
+# 3. LOG FILES (Generated automatically)
+*.log
+h1_github_actions.log
+h1_signals.log
+h1_production.log
+*.log.*
+logs/
+
+# 4. DATA/CACHE FILES
+*.csv
+h1_states.csv
+h1_production_states.csv
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.feather
+*.parquet
+cache/
+data/
+datasets/
+
+# 5. STATE/CONFIG CACHE
+h1_state_cache.json
+h1_previous_state.json
+h1_data_history.json
+state_cache/
+__pycache__/
+
+# 6. EXECUTION OUTPUT FILES
+h1_execution_summary.json
+h1_signal_detected.json
+h1_execution_error.json
+h1_market_status.json
+h1_production_summary.json
+h1_production_signal.json
+
+# 7. ARTIFACTS (GitHub Actions creates these)
+artifacts/
+output/
+
+# ============================================
+# STANDARD PYTHON IGNORES
+# ============================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# IDE FILES
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+*_backup
+backup/
+
+# ============================================
+# GITHUB ACTIONS SPECIFIC
+# ============================================
+
+# Local workflow runs
+.github/workflows/*.local.yml
+.github/actions/runner/
+
+# ============================================
+# CUSTOM FOR H1 PROJECT
+# ============================================
+
+# Backtesting results
+backtests/
+results/
+
+# Chart exports
+charts/
+plots/
+*.png
+*.jpg
+*.pdf
+# Add these lines to .gitignore
+.env
+*.log
+*.db
+__pycache__/
+*.pyc
+*.html
+h1_state_cache.json
+h1_signals.log
+h1_github_actions.log
+# Report files
+reports/
+*.html
+*.pdf
