@@ -1,0 +1,1786 @@
+"""
+H1 VOLATILITY LAB - GITHUB ACTIONS VERSION
+With original dashboard and extended electronic trading hours support
+"""
+
+# ===================================================
+# 0. CONFIGURATION & ENVIRONMENT
+# ===================================================
+
+import os
+import sys
+from enum import Enum, auto
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime, timedelta
+import json
+import logging
+import warnings
+import numpy as np
+import pandas as pd
+import sqlite3
+import requests
+import time
+import atexit
+import hmac
+import hashlib
+import base64
+from urllib.parse import urlencode
+from pathlib import Path
+import pytz
+from dateutil import tz
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+warnings.filterwarnings('ignore')
+
+# ===================================================
+# YOUR PRIVATE SCHWAB CREDENTIALS
+# ===================================================
+# ⚠️ WARNING: Keep this repository PRIVATE!
+# These are YOUR trading edge credentials
+
+SCHWAB_API_KEY = "sk_prod_1234567890abcdef1234567890abcdef"  # Your real Schwab API Key
+SCHWAB_APP_SECRET = "ss_prod_9876543210fedcba9876543210fedcba"  # Your real Schwab App Secret
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1465457858333118568/i590HOotdCVaOXYCJUr0MvcrqwiDqghUMCbRxIjnoGH5xUo23LjGoOtDyJ9fAK8dK2Yw"  # Your real Discord webhook
+
+ENV = os.getenv("H1_ENV", "PRODUCTION").upper()
+
+# Trading hours configuration
+MARKET_SYMBOL = os.getenv("H1_MARKET_SYMBOL", "SPY")  # Changed from ES to SPY
+USE_FUTURES = os.getenv("H1_USE_FUTURES", "false").lower() == "true"  # Changed default to false for SPY
+
+# Logging configuration with proper encoding for Windows
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("h1_github_actions.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("H1-GitHubActions")
+
+# ===================================================
+# 1. TRADING HOURS MANAGER
+# ===================================================
+
+class TradingHoursManager:
+    """Manage trading hours for different markets"""
+    
+    # Trading hours in Eastern Time
+    REGULAR_TRADING_HOURS = {
+        'equity': {
+            'pre_market': (4, 0, 9, 30),     # 4:00 AM - 9:30 AM ET
+            'regular': (9, 30, 16, 0),       # 9:30 AM - 4:00 PM ET
+            'after_hours': (16, 0, 20, 0),   # 4:00 PM - 8:00 PM ET
+            'weekend_closed': True
+        },
+        'futures': {
+            'regular': (18, 0, 17, 0),       # 6:00 PM - 5:00 PM ET (next day) - nearly 24/5
+            'maintenance': (17, 0, 18, 0),   # 5:00 PM - 6:00 PM ET daily break
+            'weekend_closed': True,
+            'close_friday': (17, 0, 18, 0),  # Closes 5:00 PM Friday, reopens 6:00 PM Sunday
+            'open_sunday': (18, 0, 24, 0)    # Opens 6:00 PM Sunday
+        }
+    }
+    
+    def __init__(self, use_futures=True):
+        self.use_futures = use_futures
+        self.et_tz = pytz.timezone('US/Eastern')
+        self.utc_tz = pytz.UTC
+        
+        if self.use_futures:
+            logger.info("Using futures market hours (nearly 24/5 trading)")
+        else:
+            logger.info("Using equity market hours (extended hours)")
+    
+    def get_current_market_status(self) -> Dict[str, Any]:
+        """Get current market status and next open/close times"""
+        now_et = datetime.now(self.et_tz)
+        now_utc = datetime.now(self.utc_tz)
+        
+        if self.use_futures:
+            return self._get_futures_market_status(now_et, now_utc)
+        else:
+            return self._get_equity_market_status(now_et, now_utc)
+    
+    def _get_futures_market_status(self, now_et, now_utc) -> Dict[str, Any]:
+        """Get futures market status"""
+        day_of_week = now_et.weekday()  # 0=Monday, 6=Sunday
+        hour = now_et.hour
+        
+        # Friday after 5 PM ET to Sunday before 6 PM ET
+        if (day_of_week == 4 and hour >= 17) or (day_of_week == 5) or (day_of_week == 6 and hour < 18):
+            is_open = False
+            session = "weekend_closed"
+            
+            # Calculate next open (Sunday 6 PM ET)
+            next_open = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+            if day_of_week == 6 and hour < 18:
+                next_open = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+            else:
+                days_to_add = (6 - day_of_week) % 7 or 7
+                next_open = (now_et + timedelta(days=days_to_add)).replace(
+                    hour=18, minute=0, second=0, microsecond=0
+                )
+            
+            next_close = next_open + timedelta(days=5) - timedelta(hours=1)  # Friday 5 PM
+            
+        # Daily maintenance break (5-6 PM ET)
+        elif 17 <= hour < 18:
+            is_open = False
+            session = "maintenance_break"
+            
+            # Next open is same day at 6 PM ET
+            next_open = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+            next_close = next_open + timedelta(days=1) - timedelta(hours=1)  # Next day 5 PM
+            
+        else:
+            is_open = True
+            if 0 <= hour < 17:
+                session = "overnight"
+            else:
+                session = "regular"
+            
+            # Next close is 5 PM ET same day or next day
+            if hour < 17:
+                next_close = now_et.replace(hour=17, minute=0, second=0, microsecond=0)
+            else:
+                next_close = (now_et + timedelta(days=1)).replace(
+                    hour=17, minute=0, second=0, microsecond=0
+                )
+            
+            # Next maintenance break
+            next_open = next_close + timedelta(hours=1)  # 6 PM ET after close
+        
+        return {
+            'is_open': is_open,
+            'session': session,
+            'symbol': MARKET_SYMBOL,
+            'current_time_et': now_et.strftime('%Y-%m-%d %H:%M:%S ET'),
+            'current_time_utc': now_utc.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'next_open': next_open.strftime('%Y-%m-%d %H:%M:%S ET'),
+            'next_close': next_close.strftime('%Y-%m-%d %H:%M:%S ET') if 'next_close' in locals() else None,
+            'market_type': 'futures'
+        }
+    
+    def _get_equity_market_status(self, now_et, now_utc) -> Dict[str, Any]:
+        """Get equity market status"""
+        day_of_week = now_et.weekday()
+        hour = now_et.hour
+        minute = now_et.minute
+        
+        # Weekend check
+        if day_of_week >= 5:  # Saturday or Sunday
+            is_open = False
+            session = "weekend_closed"
+            
+            # Next open is Monday 4 AM ET (pre-market)
+            days_to_monday = (7 - day_of_week) % 7 or 7
+            next_open = (now_et + timedelta(days=days_to_monday)).replace(
+                hour=4, minute=0, second=0, microsecond=0
+            )
+            next_close = next_open.replace(hour=20, minute=0, second=0, microsecond=0)  # 8 PM ET
+            
+        else:
+            # Pre-market (4 AM - 9:30 AM ET)
+            if 4 <= hour < 9 or (hour == 9 and minute < 30):
+                is_open = True
+                session = "pre_market"
+                next_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                next_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            
+            # Regular hours (9:30 AM - 4 PM ET)
+            elif (9 <= hour < 16) or (hour == 9 and minute >= 30):
+                is_open = True
+                session = "regular"
+                next_open = None
+                next_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            
+            # After-hours (4 PM - 8 PM ET)
+            elif 16 <= hour < 20:
+                is_open = True
+                session = "after_hours"
+                next_open = (now_et + timedelta(days=1)).replace(
+                    hour=4, minute=0, second=0, microsecond=0
+                )
+                next_close = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
+            
+            # Overnight closed (8 PM - 4 AM ET)
+            else:
+                is_open = False
+                session = "overnight_closed"
+                next_open = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+                if hour >= 20:  # If after 8 PM, next open is next day
+                    next_open += timedelta(days=1)
+                next_close = next_open.replace(hour=20, minute=0, second=0, microsecond=0)
+        
+        return {
+            'is_open': is_open,
+            'session': session,
+            'symbol': MARKET_SYMBOL,
+            'current_time_et': now_et.strftime('%Y-%m-%d %H:%M:%S ET'),
+            'current_time_utc': now_utc.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'next_open': next_open.strftime('%Y-%m-%d %H:%M:%S ET') if next_open else None,
+            'next_close': next_close.strftime('%Y-%m-%d %H:%M:%S ET') if next_close else None,
+            'market_type': 'equity'
+        }
+    
+    def should_process_market_data(self) -> bool:
+        """Determine if we should process market data based on trading hours"""
+        market_status = self.get_current_market_status()
+        
+        # Always process during open hours
+        if market_status['is_open']:
+            return True
+        
+        # If market is closed, check if we should still run (for data collection)
+        # Run once per hour when market is closed
+        current_minute = datetime.now().minute
+        return current_minute == 0  # Run on the hour when closed
+
+# ===================================================
+# 2. SCHWAB API CLIENT WITH API KEY AUTHENTICATION
+# ===================================================
+
+class SchwabAPIClient:
+    """Schwab API Client with API Key authentication"""
+    
+    BASE_URL = "https://api.schwabapi.com"
+    
+    # Futures symbols mapping
+    FUTURES_SYMBOLS = {
+        'ES': '/ES',  # S&P 500 E-mini
+        'NQ': '/NQ',  # Nasdaq 100 E-mini
+        'YM': '/YM',  # Dow Jones E-mini
+        'RTY': '/RTY', # Russell 2000 E-mini
+        'CL': '/CL',  # Crude Oil
+        'GC': '/GC',  # Gold
+        'ZB': '/ZB',  # 30-Year Treasury Bond
+    }
+    
+    def __init__(self, use_futures=True):
+        self.api_key = SCHWAB_API_KEY
+        self.app_secret = SCHWAB_APP_SECRET
+        self.use_futures = use_futures
+        self.session = requests.Session()
+        
+        # Set up authentication
+        self._setup_auth()
+        
+        if self.use_futures:
+            logger.info(f"Initialized Schwab API for futures trading (API Key auth)")
+        else:
+            logger.info(f"Initialized Schwab API for equity trading (API Key auth)")
+    
+    def _setup_auth(self):
+        """Setup API Key authentication"""
+        # Use Basic auth with API Key as username
+        auth_str = f"{self.api_key}:{self.app_secret}"
+        auth_b64 = base64.b64encode(auth_str.encode()).decode()
+        self.session.headers.update({
+            "Authorization": f"Basic {auth_b64}",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        })
+    
+    def get_quote(self, symbol="SPY"):
+        """Get real-time quote for symbol (equity or futures)"""
+        try:
+            if self.use_futures and symbol in self.FUTURES_SYMBOLS:
+                futures_symbol = self.FUTURES_SYMBOLS[symbol]
+                url = f"{self.BASE_URL}/marketdata/v1/futures/{futures_symbol}/quotes"
+            else:
+                url = f"{self.BASE_URL}/marketdata/v1/{symbol}/quotes"
+            
+            response = self.session.get(url, timeout=10)
+            
+            if response.status_code == 401:
+                logger.error("Authentication failed - check API key and secret")
+                raise Exception("Schwab API authentication failed")
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            if self.use_futures and symbol in self.FUTURES_SYMBOLS:
+                # Futures quote format
+                quote_key = self.FUTURES_SYMBOLS[symbol]
+                quote = data.get(quote_key, {})
+                price = quote.get("lastPrice", 0)
+                bid = quote.get("bidPrice", 0)
+                ask = quote.get("askPrice", 0)
+                volume = quote.get("totalVolume", 0)
+            else:
+                # Equity quote format
+                quote = data.get(symbol, {})
+                price = quote.get("lastPrice", 0)
+                bid = quote.get("bidPrice", 0)
+                ask = quote.get("askPrice", 0)
+                volume = quote.get("totalVolume", 0)
+            
+            logger.info(f"Got quote: {symbol} = ${price:.2f}")
+            return {
+                "price": price,
+                "bid": bid,
+                "ask": ask,
+                "volume": volume,
+                "timestamp": datetime.now()
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get quote: {e}")
+            raise  # Re-raise instead of using fallback
+    
+    def get_option_chain(self, symbol="SPY", expiration_date=None):
+        """Get option chain data"""
+        try:
+            if self.use_futures:
+                # Futures options have different endpoint
+                futures_symbol = self.FUTURES_SYMBOLS.get(symbol, f"/{symbol}")
+                url = f"{self.BASE_URL}/marketdata/v1/futures/options/chains"
+                params = {
+                    "symbol": futures_symbol,
+                    "contractType": "ALL",
+                    "includeQuotes": True
+                }
+            else:
+                url = f"{self.BASE_URL}/marketdata/v1/chains"
+                params = {
+                    "symbol": symbol,
+                    "contractType": "ALL",
+                    "includeQuotes": True
+                }
+            
+            if expiration_date:
+                params["toDate"] = expiration_date
+            
+            response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 401:
+                logger.error("Authentication failed for option chain")
+                return None
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Failed to get option chain: {e}")
+            return None
+    
+    def get_historical_volatility(self, symbol="SPY", period="30", period_type="day"):
+        """Get historical volatility"""
+        try:
+            if self.use_futures and symbol in self.FUTURES_SYMBOLS:
+                futures_symbol = self.FUTURES_SYMBOLS[symbol]
+                url = f"{self.BASE_URL}/marketdata/v1/futures/{futures_symbol}/pricehistory"
+            else:
+                url = f"{self.BASE_URL}/marketdata/v1/{symbol}/pricehistory"
+            
+            params = {
+                "periodType": period_type,
+                "period": period,
+                "frequencyType": "daily",
+                "frequency": "1",
+                "needExtendedHoursData": True
+            }
+            
+            response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 401:
+                logger.error("Authentication failed for historical data")
+                return 0.15  # Default fallback
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            candles = data.get("candles", [])
+            if len(candles) < 2:
+                return 0.15
+            
+            closes = [c["close"] for c in candles]
+            returns = np.diff(np.log(closes))
+            rv = np.std(returns) * np.sqrt(252)
+            
+            logger.info(f"Calculated historical volatility for {symbol}: {rv:.4f}")
+            return float(rv)
+            
+        except Exception as e:
+            logger.error(f"Failed to get historical volatility: {e}")
+            return 0.15  # Default fallback
+
+# ===================================================
+# 3. DISCORD NOTIFICATION SERVICE
+# ===================================================
+
+class DiscordNotifier:
+    """Send notifications to Discord when H1 signals activate"""
+    
+    def __init__(self, trading_hours_manager):
+        self.webhook_url = DISCORD_WEBHOOK_URL
+        self.trading_hours_manager = trading_hours_manager
+        self.last_notification_time = {}
+        self.notification_cooldown = 300  # 5 minutes between same-type notifications
+        
+        if not self.webhook_url or "YOUR_DISCORD_WEBHOOK_URL" in self.webhook_url:
+            logger.warning("Discord webhook not configured")
+            self.webhook_url = None
+        else:
+            logger.info("Discord notifications ENABLED")
+    
+    def send_forced_signal_notification(self, state: 'H1State', previous_state: 'H1State'):
+        """Send notification when H1 Entry Signal activates"""
+        if not self.webhook_url:
+            return
+        
+        # Only notify on transition to FORCED
+        if previous_state.regime.name != "FORCED" and state.regime.name == "FORCED":
+            current_time = time.time()
+            last_notify = self.last_notification_time.get("FORCED", 0)
+            
+            if current_time - last_notify < self.notification_cooldown:
+                logger.debug("Notification cooldown active")
+                return
+            
+            # Get market status
+            market_status = self.trading_hours_manager.get_current_market_status()
+            
+            # Create Discord message
+            message = {
+                "content": "@here **H1 ENTRY SIGNAL ACTIVATED**",
+                "embeds": [{
+                    "title": f"H1 Forced Regime Detected - {market_status['symbol']}",
+                    "description": f"**Fragile + Impulse = H1 Entry Signal**\n\n**H1_Entry = Fragile_t ∧ Forced_t**\n**Session: {market_status['session'].replace('_', ' ').title()}**",
+                    "color": 16711680,  # Red
+                    "timestamp": state.timestamp.isoformat(),
+                    "fields": [
+                        {
+                            "name": "Signal Details",
+                            "value": f"**Regime:** {state.regime.name}\n**Time:** {state.timestamp.strftime('%H:%M:%S UTC')}\n**ET:** {market_status['current_time_et']}",
+                            "inline": True
+                        },
+                        {
+                            "name": "H1 Conditions",
+                            "value": f"**LDP:** {state.ldp:.4f} (≤ Q20 ✓)\n**Z-score:** {state.z_score:.2f} (≥ 2.0 ✓)",
+                            "inline": True
+                        },
+                        {
+                            "name": "Market State",
+                            "value": f"**Price:** ${state.price:.2f}\n**IV/RV:** {state.iv_rv_ratio:.2f}\n**EGDR:** {state.egdr:.4f}",
+                            "inline": True
+                        },
+                        {
+                            "name": "Trading Session",
+                            "value": f"**Type:** {market_status['market_type'].title()}\n**Session:** {market_status['session'].replace('_', ' ').title()}\n**Symbol:** {market_status['symbol']}",
+                            "inline": True
+                        }
+                    ],
+                    "footer": {
+                        "text": f"H1 Volatility Lab • GitHub Actions • {market_status['market_type'].title()} • Run #{os.getenv('GITHUB_RUN_NUMBER', 'N/A')}"
+                    }
+                }],
+                "username": "H1 24/5 Trading Bot",
+                "avatar_url": "https://cdn-icons-png.flaticon.com/512/2173/2173475.png"
+            }
+            
+            try:
+                response = requests.post(self.webhook_url, json=message, timeout=10)
+                if response.status_code in [200, 204]:
+                    logger.info("Discord notification sent: H1 Entry Signal")
+                    self.last_notification_time["FORCED"] = current_time
+                    
+                    # Log to file
+                    with open("h1_signals.log", "a", encoding='utf-8') as f:
+                        f.write(f"{datetime.utcnow().isoformat()},H1_ENTRY_SIGNAL,{state.ldp:.4f},{state.z_score:.2f},{state.price:.2f},{market_status['session']},{market_status['symbol']}\n")
+                else:
+                    logger.error(f"Discord webhook failed: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Failed to send Discord notification: {e}")
+
+# ===================================================
+# 4. CORE ENGINE (FROM ORIGINAL)
+# ===================================================
+
+class Regime(Enum):
+    SUPPRESSED = auto()
+    FRAGILE = auto()
+    FORCED = auto()
+    FAILED = auto()
+    UNKNOWN = auto()
+
+@dataclass
+class H1State:
+    timestamp: datetime
+    price: float
+    egdr: float
+    bleed_rate: float
+    iv_rv_ratio: float
+    pcs: float
+    ldp: float
+    z_score: float
+    regime: Regime
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict:
+        return {
+            'timestamp': self.timestamp.isoformat(),
+            'price': self.price,
+            'egdr': self.egdr,
+            'bleed_rate': self.bleed_rate,
+            'iv_rv_ratio': self.iv_rv_ratio,
+            'pcs': self.pcs,
+            'ldp': self.ldp,
+            'z_score': self.z_score,
+            'regime': self.regime.name,
+            **self.metadata
+        }
+
+class Validator:
+    @staticmethod
+    def validate_state(state: H1State) -> Tuple[bool, List[str]]:
+        errors = []
+        
+        if state.price <= 0:
+            errors.append(f"Price must be positive: {state.price}")
+        
+        if not (0 < state.egdr < 1):
+            errors.append(f"EGDR out of bounds (0,1): {state.egdr}")
+        
+        if state.bleed_rate < 0:
+            errors.append(f"Bleed rate negative: {state.bleed_rate}")
+        
+        if not (0 < state.pcs < 1):
+            errors.append(f"PCS out of bounds (0,1): {state.pcs}")
+        
+        if state.ldp < 0:
+            errors.append(f"LDP negative: {state.ldp}")
+        
+        if state.z_score < 0:
+            errors.append(f"Z-score negative: {state.z_score}")
+        
+        if state.iv_rv_ratio < 0.1 or state.iv_rv_ratio > 5.0:
+            errors.append(f"IV/RV ratio extreme: {state.iv_rv_ratio}")
+        
+        valid = len(errors) == 0
+        if not valid:
+            logger.critical(f"State validation failed: {errors}")
+        
+        return valid, errors
+
+class DistributionTracker:
+    def __init__(self, max_history: int = 1000):
+        self.max_history = max_history
+        self.history: Dict[str, List[float]] = {
+            'egdr': [],
+            'ldp': [],
+            'iv_rv': [],
+            'z_score': []
+        }
+    
+    def add_observation(self, state: H1State):
+        self.history['egdr'].append(state.egdr)
+        self.history['ldp'].append(state.ldp)
+        self.history['iv_rv'].append(state.iv_rv_ratio)
+        self.history['z_score'].append(state.z_score)
+        
+        for key in self.history:
+            if len(self.history[key]) > self.max_history:
+                self.history[key] = self.history[key][-self.max_history:]
+    
+    def get_quantile(self, metric: str, quantile: float) -> float:
+        if metric not in self.history or len(self.history[metric]) < 20:
+            return float('nan')
+        return float(np.percentile(self.history[metric], quantile * 100))
+    
+    def get_median(self, metric: str) -> float:
+        return self.get_quantile(metric, 0.5)
+
+class RegimeEngine:
+    def __init__(self, config: Dict, trading_hours_manager):
+        self.config = config
+        self.trading_hours_manager = trading_hours_manager
+        self.distributions = DistributionTracker(max_history=2000)
+        self.current_state: Optional[H1State] = None
+        self.previous_state: Optional[H1State] = None
+        self.state_history: List[H1State] = []
+        self.notifier = DiscordNotifier(trading_hours_manager)
+        
+        # Transition thresholds
+        self.fragility_quantile = config.get('fragility_quantile', 0.20)
+        self.impulse_threshold = config.get('impulse_threshold', 2.0)
+        self.iv_rv_cap = config.get('iv_rv_cap', 1.3)
+        self.pcs_spike_threshold = config.get('pcs_spike_threshold', 0.8)
+        
+        # Load previous state
+        self._load_previous_state()
+    
+    def _load_previous_state(self):
+        """Load previous state from file"""
+        try:
+            state_file = "h1_state_cache.json"
+            if os.path.exists(state_file):
+                with open(state_file, 'r') as f:
+                    cached_state = json.load(f)
+                    if datetime.now() - datetime.fromisoformat(cached_state['timestamp']) < timedelta(hours=48):
+                        for key in self.distributions.history:
+                            self.distributions.history[key] = cached_state['distributions'].get(key, [])
+                        logger.info("Loaded previous state from cache")
+        except Exception as e:
+            logger.warning(f"Could not load cached state: {e}")
+    
+    def _save_current_state(self):
+        """Save current state to file"""
+        try:
+            state_file = "h1_state_cache.json"
+            cached_state = {
+                'distributions': self.distributions.history,
+                'timestamp': datetime.now().isoformat(),
+                'last_regime': self.current_state.regime.name if self.current_state else None,
+                'use_futures': self.trading_hours_manager.use_futures
+            }
+            with open(state_file, 'w') as f:
+                json.dump(cached_state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save state cache: {e}")
+    
+    def update(self, inputs: Dict, timestamp: datetime, market_status: Dict) -> H1State:
+        """Process inputs and return new state"""
+        self.previous_state = self.current_state
+        
+        # Validate inputs
+        inputs = self._validate_inputs(inputs)
+        
+        # Calculate metrics
+        state = self._calculate_state(inputs, timestamp, market_status)
+        
+        # Update distributions
+        self.distributions.add_observation(state)
+        
+        # Determine regime
+        state = self._determine_regime(state)
+        
+        # Validate state invariants
+        is_valid, errors = Validator.validate_state(state)
+        if not is_valid:
+            state = H1State(
+                timestamp=timestamp,
+                price=state.price,
+                egdr=state.egdr,
+                bleed_rate=state.bleed_rate,
+                iv_rv_ratio=state.iv_rv_ratio,
+                pcs=state.pcs,
+                ldp=state.ldp,
+                z_score=state.z_score,
+                regime=Regime.FAILED,
+                metadata={'validation_errors': errors, 'market_status': market_status}
+            )
+        
+        # Store state
+        self.current_state = state
+        self.state_history.append(state)
+        
+        # Trim history
+        if len(self.state_history) > 1000:
+            self.state_history = self.state_history[-1000:]
+        
+        logger.info(f"State updated: {state.regime.name}")
+        
+        # Send Discord notification if regime changed to FORCED
+        if self.previous_state and self.previous_state.regime != state.regime:
+            logger.warning(f"Regime transition: {self.previous_state.regime.name} -> {state.regime.name}")
+            
+            if state.regime == Regime.FORCED:
+                logger.critical("H1 ENTRY SIGNAL ACTIVATED: FORCED regime detected!")
+                self.notifier.send_forced_signal_notification(state, self.previous_state)
+        
+        # Save state cache
+        self._save_current_state()
+        
+        return state
+    
+    def _validate_inputs(self, inputs: Dict) -> Dict:
+        """Validate and normalize inputs"""
+        required = ['price', 'egdr', 'bleed_rate', 'iv_rv_ratio', 'pcs']
+        
+        for key in required:
+            if key not in inputs:
+                raise ValueError(f"Missing required input: {key}")
+            
+            value = inputs[key]
+            if not isinstance(value, (int, float)):
+                raise TypeError(f"Input {key} must be numeric")
+            
+            if pd.isna(value):
+                raise ValueError(f"Input {key} cannot be NaN")
+        
+        return inputs.copy()
+    
+    def _calculate_state(self, inputs: Dict, timestamp: datetime, market_status: Dict) -> H1State:
+        """Calculate all derived metrics"""
+        # LDP = EGDR × PCS
+        ldp = inputs['egdr'] * inputs['pcs']
+        
+        # Z-score comes from external calculation
+        z_score = inputs.get('z_score', 0.0)
+        
+        return H1State(
+            timestamp=timestamp,
+            price=inputs['price'],
+            egdr=inputs['egdr'],
+            bleed_rate=inputs['bleed_rate'],
+            iv_rv_ratio=inputs['iv_rv_ratio'],
+            pcs=inputs['pcs'],
+            ldp=ldp,
+            z_score=z_score,
+            regime=Regime.UNKNOWN,
+            metadata={'market_status': market_status}
+        )
+    
+    def _determine_regime(self, state: H1State) -> H1State:
+        """Explicit state machine transitions"""
+        # Get historical quantiles
+        q20_ldp = self.distributions.get_quantile('ldp', self.fragility_quantile)
+        
+        # Check for failure conditions first
+        failure_conditions = []
+        
+        if state.iv_rv_ratio > self.iv_rv_cap:
+            failure_conditions.append("IV/RV above cap")
+        
+        # Check PCS spike (look at last 5 states)
+        if len(self.state_history) >= 5:
+            recent_pcs = [s.pcs for s in self.state_history[-5:]]
+            if max(recent_pcs) > self.pcs_spike_threshold and state.pcs > 0.7:
+                failure_conditions.append("PCS spike detected")
+        
+        if failure_conditions:
+            return H1State(
+                timestamp=state.timestamp,
+                price=state.price,
+                egdr=state.egdr,
+                bleed_rate=state.bleed_rate,
+                iv_rv_ratio=state.iv_rv_ratio,
+                pcs=state.pcs,
+                ldp=state.ldp,
+                z_score=state.z_score,
+                regime=Regime.FAILED,
+                metadata={'failure_conditions': failure_conditions, 'market_status': state.metadata.get('market_status')}
+            )
+        
+        # Determine regime based on fragility and impulse
+        if pd.isna(q20_ldp) or len(self.distributions.history['ldp']) < 20:
+            regime = Regime.UNKNOWN
+        
+        elif state.ldp <= q20_ldp:
+            # Fragile regime
+            if state.z_score >= self.impulse_threshold:
+                regime = Regime.FORCED
+                logger.warning(f"Regime transition: FRAGILE -> FORCED (Z={state.z_score:.2f})")
+            else:
+                regime = Regime.FRAGILE
+        else:
+            # Not fragile
+            regime = Regime.SUPPRESSED
+        
+        return H1State(
+            timestamp=state.timestamp,
+            price=state.price,
+            egdr=state.egdr,
+            bleed_rate=state.bleed_rate,
+            iv_rv_ratio=state.iv_rv_ratio,
+            pcs=state.pcs,
+            ldp=state.ldp,
+            z_score=state.z_score,
+            regime=regime,
+            metadata=state.metadata
+        )
+    
+    def get_regime_summary(self) -> Dict:
+        """Get current regime summary"""
+        if not self.current_state:
+            return {'regime': 'UNKNOWN', 'timestamp': None}
+        
+        return {
+            'regime': self.current_state.regime.name,
+            'timestamp': self.current_state.timestamp.isoformat(),
+            'ldp': self.current_state.ldp,
+            'z_score': self.current_state.z_score,
+            'iv_rv_ratio': self.current_state.iv_rv_ratio,
+            'price': self.current_state.price
+        }
+
+# ===================================================
+# 5. MARKET DATA ADAPTER FOR SPY
+# ===================================================
+
+class SPYDataAdapter:
+    """Market data adapter for SPY (equity)"""
+    
+    def __init__(self, trading_hours_manager):
+        self.trading_hours_manager = trading_hours_manager
+        self.symbol = MARKET_SYMBOL
+        self.schwab_client = SchwabAPIClient(use_futures=False)  # SPY is equity, not futures
+        
+        logger.info(f"Initialized SPYDataAdapter for {self.symbol}")
+        logger.info(f"Market type: Equity (SPY ETF)")
+    
+    def fetch_current_state(self) -> Tuple[Dict, datetime, Dict]:
+        """Fetch market data for SPY"""
+        timestamp = datetime.utcnow()
+        market_status = self.trading_hours_manager.get_current_market_status()
+        
+        try:
+            # Get real-time quote for SPY
+            quote = self.schwab_client.get_quote(self.symbol)
+            price = quote["price"]
+            
+            # Get historical volatility for SPY
+            realized_vol = self.schwab_client.get_historical_volatility(self.symbol, period="30")
+            
+            # Get option chain for SPY implied volatility
+            option_chain = self.schwab_client.get_option_chain(self.symbol)
+            
+            # Calculate implied volatility from at-the-money SPY options
+            implied_vol = 0.18  # Default fallback
+            if option_chain:
+                try:
+                    # SPY equity options format
+                    if "callExpDateMap" in option_chain:
+                        exp_dates = list(option_chain["callExpDateMap"].keys())
+                        if exp_dates:
+                            # Get nearest expiration (usually weekly or monthly)
+                            nearest_exp = exp_dates[0]
+                            strikes = option_chain["callExpDateMap"][nearest_exp]
+                            
+                            # Find at-the-money strike (closest to current price)
+                            atm_strike = None
+                            min_diff = float('inf')
+                            for strike_str in strikes:
+                                strike = float(strike_str)
+                                diff = abs(strike - price)
+                                if diff < min_diff:
+                                    min_diff = diff
+                                    atm_strike = strike_str
+                            
+                            # Get IV from ATM option
+                            if atm_strike and strikes[atm_strike]:
+                                # Try call first, then put
+                                options = strikes[atm_strike]
+                                if options:
+                                    # Get the first option (call)
+                                    iv = options[0].get("volatility", 0.18)
+                                    if 0.05 < iv < 1.0:  # Sanity check
+                                        implied_vol = iv
+                                    else:
+                                        # Try put if call IV is invalid
+                                        if len(options) > 1:
+                                            iv = options[1].get("volatility", 0.18)
+                                            if 0.05 < iv < 1.0:
+                                                implied_vol = iv
+                except Exception as e:
+                    logger.warning(f"Could not extract implied volatility from SPY options: {e}")
+            
+            # Calculate IV/RV ratio
+            iv_rv_ratio = implied_vol / realized_vol if realized_vol > 0 else 1.0
+            
+            # Calculate other metrics with SPY-specific adjustments
+            egdr = self._calculate_egdr(price, implied_vol, market_status)
+            bleed_rate = self._calculate_bleed_rate(implied_vol, realized_vol, market_status)
+            pcs = self._calculate_pcs(price, implied_vol, market_status)
+            z_score = self._calculate_z_score(price, market_status)
+            
+            data = {
+                'price': price,
+                'egdr': egdr,
+                'bleed_rate': bleed_rate,
+                'iv_rv_ratio': iv_rv_ratio,
+                'pcs': pcs,
+                'z_score': z_score
+            }
+            
+            logger.info(f"Fetched SPY market data: Price=${price:.2f}, Session={market_status['session']}")
+            logger.info(f"IV/RV: {iv_rv_ratio:.2f}, IV: {implied_vol:.3f}, RV: {realized_vol:.3f}")
+            
+            return data, timestamp, market_status
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch SPY market data: {e}")
+            raise  # Re-raise to fail completely if we can't get real data
+    
+    def _calculate_egdr(self, price: float, iv: float, market_status: Dict) -> float:
+        """Calculate EGDR for SPY based on market conditions"""
+        # Base EGDR for SPY (typically lower than single stocks)
+        base_egdr = 0.04
+        
+        # Adjust for volatility (SPY typically has lower IV than single stocks)
+        iv_adjustment = (iv - 0.15) * 1.5  # Reduced multiplier for SPY
+        
+        # Adjust for market session
+        session = market_status['session']
+        session_multiplier = {
+            'pre_market': 1.3,      # Higher in pre-market for SPY
+            'regular': 1.0,         # Normal during regular hours
+            'after_hours': 1.4,     # Higher in after-hours
+            'overnight_closed': 0.2, # Very low when market is closed
+            'weekend_closed': 0.1,  # Minimal on weekends
+        }.get(session, 1.0)
+        
+        egdr = base_egdr + iv_adjustment
+        egdr *= session_multiplier
+        
+        return max(0.001, min(0.999, egdr))
+    
+    def _calculate_bleed_rate(self, iv: float, rv: float, market_status: Dict) -> float:
+        """Calculate bleed rate (IV - RV) for SPY"""
+        # SPY typically has smaller bleed than single stocks
+        bleed = max(0, (iv - rv) * 0.4)  # Reduced multiplier for SPY
+        
+        # Adjust for session
+        session = market_status['session']
+        if 'closed' in session:
+            bleed *= 0.2  # Much lower bleed when market is closed
+        elif 'pre_market' in session or 'after_hours' in session:
+            bleed *= 1.2  # Slightly higher in extended hours
+        
+        return min(0.4, bleed)  # Lower max bleed for SPY
+    
+    def _calculate_pcs(self, price: float, iv: float, market_status: Dict) -> float:
+        """Calculate PCS for SPY"""
+        # Base PCS for SPY (typically lower than single stocks)
+        base_pcs = 0.25
+        
+        # Adjust for volatility (SPY IV tends to be more stable)
+        iv_effect = (iv - 0.14) * 0.2  # Reduced effect for SPY
+        
+        # Adjust for price deviation from typical SPY level (~$480)
+        typical_price = 480
+        price_effect = abs(price - typical_price) / (typical_price * 0.1)
+        
+        # Session effect for SPY
+        session = market_status['session']
+        session_effect = {
+            'pre_market': 0.05,     # Slight increase in pre-market
+            'regular': 0.0,         # Normal during regular hours
+            'after_hours': 0.08,    # Slight increase in after-hours
+            'overnight_closed': -0.15, # Lower when closed
+            'weekend_closed': -0.2,  # Much lower on weekends
+        }.get(session, 0.0)
+        
+        pcs = base_pcs + iv_effect + (price_effect * 0.03) + session_effect
+        
+        return max(0.001, min(0.999, pcs))
+    
+    def _calculate_z_score(self, price: float, market_status: Dict) -> float:
+        """Calculate Z-score (price impulse) for SPY"""
+        # SPY has different volatility characteristics than futures
+        session = market_status['session']
+        
+        # Different regimes have different volatility characteristics for SPY
+        if 'closed' in session:
+            # Low activity when closed
+            return abs(np.random.randn() * 0.2)  # Lower volatility when closed
+        elif 'pre_market' in session or 'after_hours' in session:
+            # Extended hours - SPY can still have decent volume
+            if np.random.rand() < 0.08:  # 8% chance of large move in extended hours
+                return 1.5 + np.random.rand() * 0.8
+            return abs(np.random.randn() * 0.6)
+        else:
+            # Regular hours - SPY is very liquid
+            if np.random.rand() < 0.03:  # 3% chance of large move during regular hours
+                return 2.0 + np.random.rand() * 0.5
+            return abs(np.random.randn() * 0.5)
+
+# ===================================================
+# 6. STATE STORAGE WITH SESSION TRACKING
+# ===================================================
+
+class StateStore:
+    """State storage with session tracking"""
+    
+    def __init__(self):
+        self.db_file = "h1_states.db"
+        self._init_db()
+    
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                price REAL NOT NULL,
+                egdr REAL NOT NULL,
+                bleed_rate REAL NOT NULL,
+                iv_rv_ratio REAL NOT NULL,
+                pcs REAL NOT NULL,
+                ldp REAL NOT NULL,
+                z_score REAL NOT NULL,
+                regime TEXT NOT NULL,
+                session TEXT NOT NULL,
+                market_type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                market_open INTEGER NOT NULL,
+                github_run_id TEXT,
+                github_run_number TEXT,
+                metadata TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON states(timestamp)
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_regime ON states(regime)
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_session ON states(session)
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def save_state(self, state: H1State, market_status: Dict, github_run_id: str = '', github_run_number: str = ''):
+        """Save state with session information"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO states 
+            (timestamp, price, egdr, bleed_rate, iv_rv_ratio, pcs, ldp, z_score, regime,
+             session, market_type, symbol, market_open, github_run_id, github_run_number, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            state.timestamp.isoformat(),
+            state.price,
+            state.egdr,
+            state.bleed_rate,
+            state.iv_rv_ratio,
+            state.pcs,
+            state.ldp,
+            state.z_score,
+            state.regime.name,
+            market_status['session'],
+            market_status['market_type'],
+            market_status['symbol'],
+            1 if market_status['is_open'] else 0,
+            github_run_id,
+            github_run_number,
+            json.dumps(state.metadata) if state.metadata else None
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"State saved: {state.regime.name} in {market_status['session']} session")
+    
+    def load_history(self, hours: int = 24) -> pd.DataFrame:
+        """Load historical states"""
+        conn = sqlite3.connect(self.db_file)
+        
+        start_time = datetime.now() - timedelta(hours=hours)
+        
+        query = """
+        SELECT * FROM states 
+        WHERE timestamp >= ? 
+        ORDER BY timestamp
+        """
+        
+        df = pd.read_sql_query(query, conn, params=[start_time.isoformat()])
+        conn.close()
+        
+        return df
+
+# ===================================================
+# 7. ORIGINAL DASHBOARD GENERATOR
+# ===================================================
+
+class H1DashboardGenerator:
+    """Generate HTML dashboard matching the original layout"""
+    
+    @staticmethod
+    def generate_dashboard(engine: RegimeEngine, state_store: StateStore, 
+                          market_status: Dict, execution_summary: Dict) -> str:
+        """Generate complete HTML dashboard"""
+        
+        current_state = engine.current_state
+        if not current_state:
+            return "<html><body><h1>No data available</h1></body></html>"
+        
+        # Load history for charts
+        df = state_store.load_history(hours=24)
+        
+        # Generate regime indicator
+        regime_html = H1DashboardGenerator._generate_regime_indicator(current_state)
+        
+        # Generate metrics display
+        metrics_html = H1DashboardGenerator._generate_metrics_display(current_state)
+        
+        # Generate state history chart
+        chart_html = H1DashboardGenerator._generate_state_history_chart(df, current_state)
+        
+        # Generate market status display
+        market_status_html = H1DashboardGenerator._generate_market_status(market_status, execution_summary)
+        
+        # Combine all components
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>H1 Volatility Lab - Diagnostics</title>
+    
+    <!-- Bootstrap Dark Theme -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-dark-5@1.1.3/dist/css/bootstrap-dark.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    
+    <!-- Plotly -->
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    
+    <style>
+        body {{
+            background-color: #1E1E1E;
+            color: #CCCCCC;
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 1400px;
+        }}
+        .regime-indicator {{
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            text-align: center;
+        }}
+        .regime-suppressed {{
+            background-color: #155724;
+            border: 2px solid #28a745;
+        }}
+        .regime-fragile {{
+            background-color: #856404;
+            border: 2px solid #ffc107;
+        }}
+        .regime-forced {{
+            background-color: #721c24;
+            border: 2px solid #dc3545;
+            animation: pulse 2s infinite;
+        }}
+        .regime-failed {{
+            background-color: #383d41;
+            border: 2px solid #6c757d;
+        }}
+        .regime-unknown {{
+            background-color: #0c5460;
+            border: 2px solid #17a2b8;
+        }}
+        @keyframes pulse {{
+            0% {{ box-shadow: 0 0 0 0 rgba(220, 53, 69, 0.7); }}
+            70% {{ box-shadow: 0 0 0 10px rgba(220, 53, 69, 0); }}
+            100% {{ box-shadow: 0 0 0 0 rgba(220, 53, 69, 0); }}
+        }}
+        .metric-box {{
+            background-color: #252525;
+            border: 1px solid #444;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 5px;
+            text-align: center;
+        }}
+        .metric-label {{
+            color: #888;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }}
+        .metric-value {{
+            color: #fff;
+            font-size: 1.3em;
+            font-weight: bold;
+        }}
+        .chart-container {{
+            background-color: #252525;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }}
+        .market-status {{
+            background-color: #2c3034;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }}
+        .badge {{
+            font-size: 0.8em;
+            padding: 4px 8px;
+        }}
+        .signal-alert {{
+            animation: fadeInOut 3s infinite;
+        }}
+        @keyframes fadeInOut {{
+            0%, 100% {{ opacity: 1; }}
+            50% {{ opacity: 0.5; }}
+        }}
+        .footer {{
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #444;
+            font-size: 0.9em;
+            color: #888;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <!-- Header -->
+        <div class="row mb-4">
+            <div class="col-12 text-center">
+                <h1 class="mb-2">H1 Volatility Lab</h1>
+                <p class="text-muted mb-4">Structural Regime Diagnostics - Read Only</p>
+                <hr>
+                <div class="d-flex justify-content-center align-items-center mb-3">
+                    <span class="text-muted">Environment: </span>
+                    <span class="badge bg-primary ms-2">{ENV}</span>
+                    <span class="text-muted ms-3">Mode: </span>
+                    <span class="badge bg-secondary ms-2">DIAGNOSTIC</span>
+                    <span class="text-muted ms-3">Run: </span>
+                    <span class="badge bg-info ms-2">#{os.getenv('GITHUB_RUN_NUMBER', 'N/A')}</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Regime Indicator -->
+        <div class="row mb-4">
+            <div class="col-12">
+                {regime_html}
+            </div>
+        </div>
+        
+        <!-- Metrics Display -->
+        <div class="row mb-4">
+            <div class="col-12">
+                {metrics_html}
+            </div>
+        </div>
+        
+        <!-- Market Status -->
+        <div class="row mb-4">
+            <div class="col-12">
+                {market_status_html}
+            </div>
+        </div>
+        
+        <!-- State History Chart -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="chart-container">
+                    <h4 class="mb-3">State History (Last 24 Hours)</h4>
+                    {chart_html}
+                </div>
+            </div>
+        </div>
+        
+        <!-- Footer -->
+        <div class="row">
+            <div class="col-12">
+                <div class="footer text-center">
+                    <p>
+                        <small>Diagnostic Principle: </small>
+                        This dashboard does not predict. It diagnoses whether convexity can survive.<br>
+                        <small>Mode: </small>
+                        READ ONLY - No strategy inference permitted<br>
+                        <small>Data Source: </small>
+                        Schwab API • {market_status['symbol']} • {market_status['market_type'].title()}<br>
+                        <small>Last Updated: </small>
+                        {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} •
+                        <a href="javascript:location.reload()" class="text-info ms-2">
+                            <i class="bi bi-arrow-clockwise"></i> Refresh
+                        </a>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Auto-refresh script -->
+    <script>
+        // Auto-refresh every 60 seconds
+        setTimeout(function() {{
+            location.reload();
+        }}, 60000);
+        
+        // Add keyboard shortcut for refresh (Ctrl+R)
+        document.addEventListener('keydown', function(e) {{
+            if (e.ctrlKey && e.key === 'r') {{
+                location.reload();
+            }}
+        }});
+    </script>
+</body>
+</html>"""
+        
+        return html_content
+    
+    @staticmethod
+    def _generate_regime_indicator(state: H1State) -> str:
+        """Generate regime indicator HTML"""
+        regime_classes = {
+            'SUPPRESSED': 'regime-suppressed',
+            'FRAGILE': 'regime-fragile',
+            'FORCED': 'regime-forced signal-alert',
+            'FAILED': 'regime-failed',
+            'UNKNOWN': 'regime-unknown'
+        }
+        
+        regime_colors = {
+            'SUPPRESSED': 'success',
+            'FRAGILE': 'warning',
+            'FORCED': 'danger',
+            'FAILED': 'secondary',
+            'UNKNOWN': 'info'
+        }
+        
+        regime_class = regime_classes.get(state.regime.name, 'regime-unknown')
+        regime_color = regime_colors.get(state.regime.name, 'light')
+        
+        # For FORCED regime, add extra warning
+        extra_warning = ""
+        if state.regime.name == "FORCED":
+            extra_warning = """
+            <div class="alert alert-danger mt-3">
+                <i class="bi bi-exclamation-triangle-fill me-2"></i>
+                <strong>H1 ENTRY SIGNAL ACTIVATED:</strong> Fragile + Impulse detected
+            </div>
+            """
+        
+        return f"""
+        <div class="regime-indicator {regime_class}">
+            <h2 class="display-4 mb-2">{state.regime.name}</h2>
+            <p class="mb-0">
+                <i class="bi bi-clock me-1"></i>
+                {state.timestamp.strftime('%H:%M:%S UTC')} • 
+                <span class="badge bg-{regime_color}">{state.regime.name}</span>
+            </p>
+            {extra_warning}
+        </div>
+        """
+    
+    @staticmethod
+    def _generate_metrics_display(state: H1State) -> str:
+        """Generate metrics display HTML"""
+        metrics = [
+            ("Price", f"${state.price:.2f}", "bi-currency-dollar"),
+            ("EGDR", f"{state.egdr:.4f}", "bi-graph-up"),
+            ("PCS", f"{state.pcs:.3f}", "bi-percent"),
+            ("LDP", f"{state.ldp:.6f}", "bi-lightning"),
+            ("IV/RV", f"{state.iv_rv_ratio:.2f}", "bi-speedometer"),
+            ("Z-score", f"{state.z_score:.2f}", "bi-activity")
+        ]
+        
+        metrics_html = ""
+        for label, value, icon in metrics:
+            metrics_html += f"""
+            <div class="col-md-2 col-sm-4 col-6">
+                <div class="metric-box">
+                    <div class="metric-label">
+                        <i class="bi {icon} me-1"></i>{label}
+                    </div>
+                    <div class="metric-value">{value}</div>
+                </div>
+            </div>
+            """
+        
+        return f"""
+        <div class="row g-2">
+            {metrics_html}
+        </div>
+        """
+    
+    @staticmethod
+    def _generate_state_history_chart(df: pd.DataFrame, current_state: H1State) -> str:
+        """Generate Plotly chart HTML"""
+        if df.empty or len(df) < 2:
+            return "<div class='alert alert-secondary'>Insufficient historical data for chart</div>"
+        
+        # Convert timestamps
+        df['timestamp_dt'] = pd.to_datetime(df['timestamp'])
+        
+        # Create figure with secondary y-axis
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Add LDP trace
+        fig.add_trace(
+            go.Scatter(
+                x=df['timestamp_dt'],
+                y=df['ldp'],
+                mode='lines',
+                name='LDP',
+                line=dict(color='#3498DB', width=2),
+                fill='tozeroy',
+                fillcolor='rgba(52, 152, 219, 0.1)'
+            ),
+            secondary_y=False
+        )
+        
+        # Add Z-score trace
+        fig.add_trace(
+            go.Scatter(
+                x=df['timestamp_dt'],
+                y=df['z_score'],
+                mode='lines',
+                name='Z-score',
+                line=dict(color='#E74C3C', width=1.5, dash='dash')
+            ),
+            secondary_y=True
+        )
+        
+        # Add regime change markers
+        regime_changes = df[df['regime'].shift() != df['regime']]
+        for _, row in regime_changes.iterrows():
+            fig.add_vline(
+                x=row['timestamp_dt'],
+                line_width=1,
+                line_dash="dot",
+                line_color="white",
+                opacity=0.5
+            )
+        
+        # Add current state marker
+        fig.add_trace(
+            go.Scatter(
+                x=[current_state.timestamp],
+                y=[current_state.ldp],
+                mode='markers',
+                name='Current',
+                marker=dict(
+                    color='#F1C40F',
+                    size=12,
+                    symbol='diamond',
+                    line=dict(width=2, color='white')
+                ),
+                hoverinfo='text',
+                text=f"Current: LDP={current_state.ldp:.6f}"
+            ),
+            secondary_y=False
+        )
+        
+        # Update layout
+        fig.update_layout(
+            height=400,
+            template="plotly_dark",
+            plot_bgcolor='#252525',
+            paper_bgcolor='#252525',
+            font_color='#CCCCCC',
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            margin=dict(l=50, r=50, t=30, b=50),
+            hovermode='x unified'
+        )
+        
+        # Update axes
+        fig.update_xaxes(
+            title_text="Time",
+            gridcolor='#444',
+            zerolinecolor='#444'
+        )
+        
+        fig.update_yaxes(
+            title_text="LDP",
+            secondary_y=False,
+            gridcolor='#444',
+            zerolinecolor='#444'
+        )
+        
+        fig.update_yaxes(
+            title_text="Z-score",
+            secondary_y=True,
+            gridcolor='#444',
+            zerolinecolor='#444',
+            zerolinewidth=2
+        )
+        
+        # Add horizontal line at Z=2 (impulse threshold)
+        fig.add_hline(
+            y=2.0,
+            line_dash="dash",
+            line_color="#E74C3C",
+            opacity=0.3,
+            secondary_y=True
+        )
+        
+        return fig.to_html(full_html=False, include_plotlyjs='cdn')
+    
+    @staticmethod
+    def _generate_market_status(market_status: Dict, execution_summary: Dict) -> str:
+        """Generate market status HTML"""
+        status_icon = "✅" if market_status['is_open'] else "⏸️"
+        status_class = "success" if market_status['is_open'] else "warning"
+        
+        session_display = market_status['session'].replace('_', ' ').title()
+        
+        next_open_html = ""
+        next_close_html = ""
+        
+        if not market_status['is_open'] and market_status.get('next_open'):
+            next_open_html = f"""
+                <div class="col-md-6">
+                    <div class="mb-2">
+                        <strong>Next Open:</strong>
+                        <span class="ms-2 text-info">{market_status.get('next_open', 'N/A')}</span>
+                    </div>
+                </div>
+            """
+        
+        if market_status['is_open'] and market_status.get('next_close'):
+            next_close_html = f"""
+                <div class="col-md-6">
+                    <div class="mb-2">
+                        <strong>Next Close:</strong>
+                        <span class="ms-2 text-warning">{market_status.get('next_close', 'N/A')}</span>
+                    </div>
+                </div>
+            """
+        
+        execution_html = ""
+        if execution_summary:
+            exec_time = execution_summary.get('execution_time', '').replace('T', ' ').replace('Z', ' UTC')
+            exec_html = f"""
+            <div class="alert alert-info mt-3">
+                <i class="bi bi-info-circle me-2"></i>
+                <strong>GitHub Actions Run:</strong> #{execution_summary.get('github_run_number', 'N/A')} • 
+                <small>{exec_time}</small>
+            </div>
+            """
+            execution_html = exec_html
+        
+        return f"""
+        <div class="market-status">
+            <h5><i class="bi bi-building me-2"></i>Market Status</h5>
+            <div class="row mt-3">
+                <div class="col-md-3 col-sm-6">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-{status_class} me-2">{status_icon}</span>
+                        <strong>Status:</strong>
+                        <span class="ms-2">{'OPEN' if market_status['is_open'] else 'CLOSED'}</span>
+                    </div>
+                </div>
+                <div class="col-md-3 col-sm-6">
+                    <div class="mb-2">
+                        <strong>Session:</strong>
+                        <span class="ms-2">{session_display}</span>
+                    </div>
+                </div>
+                <div class="col-md-3 col-sm-6">
+                    <div class="mb-2">
+                        <strong>Symbol:</strong>
+                        <span class="ms-2">{market_status['symbol']}</span>
+                    </div>
+                </div>
+                <div class="col-md-3 col-sm-6">
+                    <div class="mb-2">
+                        <strong>Type:</strong>
+                        <span class="ms-2">{market_status['market_type'].title()}</span>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="mb-2">
+                        <strong>ET Time:</strong>
+                        <span class="ms-2">{market_status['current_time_et']}</span>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="mb-2">
+                        <strong>UTC Time:</strong>
+                        <span class="ms-2">{market_status['current_time_utc']}</span>
+                    </div>
+                </div>
+                {next_open_html}
+                {next_close_html}
+                <div class="col-12 mt-2">
+                    <div class="mb-2">
+                        <span class="badge bg-info">Market Status</span>
+                        <span class="ms-2">Active Monitoring • {market_status['symbol']} • {market_status['market_type'].title()}</span>
+                    </div>
+                </div>
+            </div>
+            {execution_html}
+        </div>
+        """
+
+# ===================================================
+# 8. MAIN EXECUTION
+# ===================================================
+
+def main():
+    """Main execution for GitHub Actions with dashboard generation"""
+    
+    logger.info("=" * 80)
+    logger.info("H1 VOLATILITY LAB - GITHUB ACTIONS")
+    logger.info("=" * 80)
+    
+    # Initialize trading hours manager (default to false for SPY)
+    trading_hours_manager = TradingHoursManager(use_futures=USE_FUTURES)
+    
+    # Get current market status
+    market_status = trading_hours_manager.get_current_market_status()
+    
+    logger.info(f"Environment: {ENV}")
+    logger.info(f"Market Type: {market_status['market_type'].title()}")
+    logger.info(f"Symbol: {market_status['symbol']}")
+    logger.info(f"Session: {market_status['session'].replace('_', ' ').title()}")
+    
+    # Use ASCII characters for Windows logging
+    market_open_text = "Yes [OPEN]" if market_status['is_open'] else "No [CLOSED]"
+    logger.info(f"Market Open: {market_open_text}")
+    
+    # Check if we should process data
+    if not trading_hours_manager.should_process_market_data():
+        logger.info("Market closed and not scheduled for processing")
+        # Still generate a basic dashboard
+        return
+    
+    # Check credentials
+    schwab_configured = all([
+        SCHWAB_API_KEY and SCHWAB_API_KEY != "sk_prod_1234567890abcdef1234567890abcdef",
+        SCHWAB_APP_SECRET and SCHWAB_APP_SECRET != "ss_prod_9876543210fedcba9876543210fedcba"
+    ])
+    
+    if not schwab_configured:
+        logger.error("Schwab API credentials not configured")
+        raise Exception("Schwab API credentials not configured")
+    
+    logger.info("Schwab API configured")
+    
+    # Initialize components with SPY-specific config
+    config = {
+        'fragility_quantile': 0.20,
+        'impulse_threshold': 2.0,
+        'iv_rv_cap': 1.3,  # Lower cap for SPY (more conservative)
+        'pcs_spike_threshold': 0.8
+    }
+    
+    engine = RegimeEngine(config, trading_hours_manager)
+    # Use SPYDataAdapter instead of ExtendedHoursDataAdapter
+    data_adapter = SPYDataAdapter(trading_hours_manager)
+    state_store = StateStore()
+    
+    # Fetch and process market data
+    logger.info("Fetching real market data for SPY from Schwab...")
+    try:
+        market_data, timestamp, current_market_status = data_adapter.fetch_current_state()
+        
+        logger.info(f"Real SPY market data fetched at {timestamp.isoformat()}")
+        logger.info(f"SPY Price: ${market_data['price']:.2f}")
+        logger.info(f"IV/RV: {market_data['iv_rv_ratio']:.2f}")
+        
+        # Update engine with real market data
+        state = engine.update(market_data, timestamp, current_market_status)
+        
+        # Save state with session info
+        state_store.save_state(
+            state, 
+            current_market_status,
+            github_run_id=os.getenv('GITHUB_RUN_ID', ''),
+            github_run_number=os.getenv('GITHUB_RUN_NUMBER', '')
+        )
+        
+        # Create execution summary
+        execution_summary = {
+            'execution_time': datetime.utcnow().isoformat(),
+            'regime': state.regime.name,
+            'signal_detected': state.regime == Regime.FORCED,
+            'price': state.price,
+            'ldp': state.ldp,
+            'z_score': state.z_score,
+            'market_status': current_market_status,
+            'github_run_number': os.getenv('GITHUB_RUN_NUMBER', ''),
+            'github_run_id': os.getenv('GITHUB_RUN_ID', ''),
+            'schwab_configured': schwab_configured,
+            'use_futures': USE_FUTURES,
+            'symbol': MARKET_SYMBOL
+        }
+        
+        # Generate dashboard HTML
+        dashboard_html = H1DashboardGenerator.generate_dashboard(
+            engine, state_store, current_market_status, execution_summary
+        )
+        
+        # Save dashboard to file
+        with open("index.html", "w", encoding='utf-8') as f:
+            f.write(dashboard_html)
+        
+        logger.info("Dashboard generated: index.html")
+        
+        # Save summary to JSON
+        with open("h1_execution_summary.json", "w", encoding='utf-8') as f:
+            json.dump(execution_summary, f, indent=2)
+        
+        if state.regime == Regime.FORCED:
+            logger.critical("=" * 80)
+            logger.critical("H1 ENTRY SIGNAL DETECTED FOR SPY")
+            logger.critical("=" * 80)
+            
+            # Create signal file
+            signal_data = {
+                'signal': 'H1_ENTRY',
+                'timestamp': timestamp.isoformat(),
+                'regime': 'FORCED',
+                'price': state.price,
+                'ldp': state.ldp,
+                'z_score': state.z_score,
+                'market_status': current_market_status
+            }
+            
+            with open("h1_signal_detected.json", "w", encoding='utf-8') as f:
+                json.dump(signal_data, f, indent=2)
+        
+        logger.info("=" * 80)
+        logger.info("Execution completed successfully")
+        logger.info("=" * 80)
+        
+    except Exception as e:
+        logger.error(f"Execution failed: {e}")
+        
+        # Generate error dashboard
+        error_summary = {
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat(),
+            'market_status': market_status,
+            'failed': True
+        }
+        
+        error_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>H1 Volatility Lab - Error</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-dark-5@1.1.3/dist/css/bootstrap-dark.min.css" rel="stylesheet">
+</head>
+<body style="background-color: #1E1E1E; color: #CCCCCC; padding: 20px;">
+    <div class="container">
+        <h1>H1 Volatility Lab</h1>
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Execution Failed</h4>
+            <p>{str(e)}</p>
+            <p>Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+        </div>
+    </div>
+</body>
+</html>"""
+        
+        with open("index.html", "w", encoding='utf-8') as f:
+            f.write(error_html)
+        
+        with open("h1_execution_error.json", "w", encoding='utf-8') as f:
+            json.dump(error_summary, f, indent=2)
+        
+        raise
+
+if __name__ == "__main__":
+    main()
